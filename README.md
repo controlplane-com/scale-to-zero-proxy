@@ -2,7 +2,7 @@
 
 Scale-to-zero for raw-TCP workloads on Control Plane — an always-on proxy that holds incoming connections, wakes the suspended workload, and suspends it again when idle.
 
-## Why
+## Purpose
 
 Control Plane's serverless workloads scale to zero natively — but only for HTTP. Raw-TCP services (SFTP, databases, brokers, game servers) must run as standard/stateful workloads, and the platform neither holds inbound TCP connections during a scale-up nor scales standard workloads to zero without KEDA. This proxy fills that gap: it is the tiny always-on floor that makes a TCP workload effectively serverless.
 
