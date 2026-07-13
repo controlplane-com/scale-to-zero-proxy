@@ -41,8 +41,11 @@ Single static Go binary, distroless image, deployed as a standard `minScale: 1` 
 | `WAKE_POLL_INTERVAL` / `WAKE_TIMEOUT` | readiness-gate dial cadence and give-up bound |
 | `HEALTH_PORT` | HTTP health endpoint for the proxy's own probes |
 
-### Open items (validate before/while building)
+### Resolved (micro-spike, 2026-07-13)
 
-1. **CPLN_TOKEN permission micro-spike**: confirm a workload identity + scoped policy can PATCH another workload's `suspend` flag, and identify the minimal permission verb. This is the load-bearing assumption.
-2. Exact PATCH shape and API endpoint for workload spec updates from inside a workload.
+1. **Auth from inside a workload — VALIDATED, with a critical gotcha.** Calls must go to **`$CPLN_ENDPOINT`** (injected env, value `http://api.cpln.io` — plain HTTP; this path attests the calling workload) with a **raw `Authorization: $CPLN_TOKEN` header** (no `Bearer`). Calling `https://api.cpln.io` directly arrives as anonymous and 403s — the token is only honored on the attested path, and only from the workload it was injected into. Permission verb: `edit`; policy is `targetKind: workload` + `targetLinks` pinned to exactly the target workload. Negative test confirmed: PATCHing any other workload returns 403 naming the identity as the principal.
+2. **PATCH shape — VALIDATED**: `PATCH {CPLN_ENDPOINT}/org/{org}/gvc/{gvc}/workload/{name}` with deep-merge body `{"spec":{"defaultOptions":{"suspend":true|false}}}` (cpln's patch syntax deep-merges scalars; `$`-operators only needed for arrays/removals). Returns 200 + updated workload. Suspend drains the deployment; un-suspend to ready measured at **14s** (consistent with the earlier 10–18s window).
+
+### Open items
+
 3. Client-observed connect→banner timing through the full proxy path (e2e test with a real sftp client) vs the ~15s bar.
