@@ -19,7 +19,7 @@ Single static Go binary, distroless image, deployed as a standard `minScale: 1` 
 
 - On inbound accept: hold the connection (no bytes). If target is suspended/waking, trigger wake (singleflight — N connects, one API call).
 - Wake: `PATCH` the target workload, `spec.defaultOptions.suspend: false`, authorized by the proxy's workload identity (injected `CPLN_TOKEN`; policy grants edit on exactly the target workload — no service-account keys).
-- Readiness gate: TCP-dial the target's internal endpoint port until accept; only then splice held connections (application handshakes must reach the real backend, never the proxy).
+- Readiness gate — **banner probe, not TCP-accept** (live-e2e finding 2026-07-13): the Control Plane mesh ACCEPTS connections to suspended workloads, so a successful dial to the internal endpoint proves nothing. A probe connection must receive the server's first bytes (e.g. the SSH banner) within `PROBE_WINDOW` to count as ready; the probe connection is discarded and the splice always uses a fresh one. Consequence: **v1 supports server-speaks-first protocols** (SSH/SFTP, FTP control, SMTP, ...); a workload-status API probe mode is noted as future work for client-speaks-first protocols.
 - Active-connection tracking: splice count > 0 → target stays awake. Count hits 0 → idle-hold timer starts; any new connection cancels it. Timer expiry → `PATCH suspend: true`.
 - Held-connection cap: connections held longer than a configurable max-hold are dropped (dead clients must not pin wakes).
 

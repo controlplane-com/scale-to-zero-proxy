@@ -54,6 +54,7 @@ func run(log *slog.Logger) error {
 		MaxHold:          cfg.MaxHold,
 		WakePollInterval: cfg.WakePollInterval,
 		WakeTimeout:      cfg.WakeTimeout,
+		ProbeWindow:      cfg.ProbeWindow,
 		Logger:           log,
 	})
 	defer act.Close()

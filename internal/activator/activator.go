@@ -32,6 +32,12 @@ type Options struct {
 	WakeTimeout time.Duration
 	// DialTimeout bounds individual TCP dials to the target.
 	DialTimeout time.Duration
+	// ProbeWindow is how long a readiness probe waits for the server's first
+	// bytes after connecting. On Control Plane the mesh ACCEPTS connections to
+	// suspended workloads, so a successful dial proves nothing — only actual
+	// server bytes (e.g. an SSH banner) prove the backend is really there.
+	// This assumes a server-speaks-first protocol (SSH/SFTP, FTP, SMTP, ...).
+	ProbeWindow time.Duration
 	// SuspendTimeout bounds the suspend API call issued by the idle timer.
 	SuspendTimeout time.Duration
 
@@ -44,6 +50,9 @@ func (o *Options) fillDefaults() {
 	}
 	if o.WakePollInterval <= 0 {
 		o.WakePollInterval = 500 * time.Millisecond
+	}
+	if o.ProbeWindow <= 0 {
+		o.ProbeWindow = 2 * time.Second
 	}
 	if o.WakeTimeout <= 0 {
 		o.WakeTimeout = 120 * time.Second
@@ -144,12 +153,12 @@ func (a *Activator) HandleConn(ctx context.Context, client net.Conn, targetPort 
 func (a *Activator) connectBackend(ctx context.Context, targetPort int) (net.Conn, error) {
 	addr := net.JoinHostPort(a.opt.TargetHost, strconv.Itoa(targetPort))
 
-	// Fast path: target already up.
-	if conn, err := a.dial(ctx, addr); err == nil {
-		return conn, nil
+	// Fast path: target proves it is really up by speaking first.
+	if err := a.probeReady(ctx, addr); err == nil {
+		return a.dial(ctx, addr)
 	}
 
-	// Slow path: trigger (or join) a wake, then dial for real.
+	// Slow path: trigger (or join) a wake, then dial fresh for the splice.
 	if err := a.ensureAwake(ctx, addr); err != nil {
 		return nil, err
 	}
@@ -159,6 +168,33 @@ func (a *Activator) connectBackend(ctx context.Context, targetPort int) (net.Con
 func (a *Activator) dial(ctx context.Context, addr string) (net.Conn, error) {
 	d := net.Dialer{Timeout: a.opt.DialTimeout}
 	return d.DialContext(ctx, "tcp", addr)
+}
+
+// probeReady classifies whether the backend is truly ready. A plain TCP dial
+// is NOT sufficient: Control Plane's mesh accepts connections for suspended
+// workloads (verified on-platform 2026-07-13), leaving a silent dead pipe.
+// Real readiness = the server sends its first bytes (e.g. the SSH banner)
+// within ProbeWindow, on a probe connection we then discard. The splice
+// always uses a fresh connection so the client sees the full protocol
+// exchange from byte zero.
+func (a *Activator) probeReady(ctx context.Context, addr string) error {
+	conn, err := a.dial(ctx, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(a.opt.ProbeWindow)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	conn.SetReadDeadline(deadline) //nolint:errcheck
+
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err != nil {
+		return fmt.Errorf("no server bytes within probe window (a bare TCP accept can be the mesh, not the backend): %w", err)
+	}
+	return nil
 }
 
 // ensureAwake joins the in-flight wake operation, starting one if none exists
@@ -206,16 +242,13 @@ func (a *Activator) runWake(w *wakeOp, addr string) {
 	close(w.done)
 }
 
-// waitReady polls the target port until a TCP dial succeeds. A successful dial
-// is the readiness signal — the application itself is listening, not just the
-// platform reporting the workload healthy.
+// waitReady polls the target until a probe proves the application itself is
+// answering — not the mesh, and not just the platform reporting healthy.
 func (a *Activator) waitReady(ctx context.Context, addr string) error {
 	ticker := time.NewTicker(a.opt.WakePollInterval)
 	defer ticker.Stop()
 	for {
-		conn, err := a.dial(ctx, addr)
-		if err == nil {
-			conn.Close()
+		if err := a.probeReady(ctx, addr); err == nil {
 			return nil
 		}
 		select {

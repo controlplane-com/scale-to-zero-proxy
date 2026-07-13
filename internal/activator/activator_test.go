@@ -6,43 +6,68 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// fakeAPI simulates the Control Plane API: SetSuspend(false) starts a real
-// TCP echo listener on a pre-reserved port; SetSuspend(true) stops it.
+// fakeAPI models the Control Plane environment accurately: the target address
+// ALWAYS accepts TCP (the mesh answers even for suspended workloads — verified
+// on-platform 2026-07-13). What changes with suspend state is behavior after
+// accept: suspended = silent dead pipe; awake = server banner, then echo.
 type fakeAPI struct {
-	t    *testing.T
-	port int
+	t  *testing.T
+	ln net.Listener
 
-	mu           sync.Mutex
-	ln           net.Listener
+	awake        atomic.Bool
 	wakeCalls    atomic.Int32
 	suspendCalls atomic.Int32
-	failWakes    bool // SetSuspend(false) succeeds but backend never listens
+	failWakes    bool // API accepts the wake but the backend never comes up
 	suspended    chan struct{}
 }
 
+const banner = "BANNER\n"
+
 func newFakeAPI(t *testing.T) *fakeAPI {
 	t.Helper()
-	// Reserve a port, then free it so the "suspended" state is a real
-	// connection-refused until wake starts the listener.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-	return &fakeAPI{t: t, port: port, suspended: make(chan struct{}, 8)}
+	f := &fakeAPI{t: t, ln: ln, suspended: make(chan struct{}, 8)}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go f.serve(c)
+		}
+	}()
+	return f
+}
+
+func (f *fakeAPI) port() int { return f.ln.Addr().(*net.TCPAddr).Port }
+
+func (f *fakeAPI) serve(c net.Conn) {
+	defer c.Close()
+	if !f.awake.Load() {
+		// Mesh-with-no-backend: connection stays open, silent, sends nothing.
+		io.Copy(io.Discard, c) //nolint:errcheck
+		return
+	}
+	// Real server-first backend: banner, then echo until client half-closes.
+	if _, err := c.Write([]byte(banner)); err != nil {
+		return
+	}
+	io.Copy(c, c) //nolint:errcheck
 }
 
 func (f *fakeAPI) SetSuspend(_ context.Context, suspend bool) error {
 	if suspend {
 		f.suspendCalls.Add(1)
-		f.stop()
+		f.awake.Store(false)
 		select {
 		case f.suspended <- struct{}{}:
 		default:
@@ -50,48 +75,13 @@ func (f *fakeAPI) SetSuspend(_ context.Context, suspend bool) error {
 		return nil
 	}
 	f.wakeCalls.Add(1)
-	if f.failWakes {
-		return nil // API accepts, but the backend never comes up
+	if !f.failWakes {
+		f.awake.Store(true)
 	}
-	return f.start()
-}
-
-func (f *fakeAPI) start() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.ln != nil {
-		return nil
-	}
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", f.port))
-	if err != nil {
-		return err
-	}
-	f.ln = ln
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				io.Copy(c, c) //nolint:errcheck // echo until client half-closes
-				c.Close()     // a real server closes when done; the splice relies on EOF
-			}(c)
-		}
-	}()
 	return nil
 }
 
-func (f *fakeAPI) stop() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.ln != nil {
-		f.ln.Close()
-		f.ln = nil
-	}
-}
-
-func testOptions(port int) Options {
+func testOptions() Options {
 	return Options{
 		TargetHost:       "127.0.0.1",
 		IdleHold:         150 * time.Millisecond,
@@ -99,12 +89,14 @@ func testOptions(port int) Options {
 		WakePollInterval: 10 * time.Millisecond,
 		WakeTimeout:      2 * time.Second,
 		DialTimeout:      200 * time.Millisecond,
+		ProbeWindow:      100 * time.Millisecond,
 		SuspendTimeout:   time.Second,
 		Logger:           slog.New(slog.DiscardHandler),
 	}
 }
 
-// runClient pushes a payload through the proxy path and asserts the echo.
+// runClient pushes a payload through the proxy path, expecting the server
+// banner first (server-speaks-first protocol), then an echo of the payload.
 func runClient(t *testing.T, a *Activator, port int, payload string) error {
 	t.Helper()
 	clientSide, proxySide := net.Pipe()
@@ -119,12 +111,19 @@ func runClient(t *testing.T, a *Activator, port int, payload string) error {
 	}()
 
 	clientSide.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+	got := make([]byte, len(banner))
+	if _, err := io.ReadFull(clientSide, got); err != nil {
+		return fmt.Errorf("read banner: %w", err)
+	}
+	if string(got) != banner {
+		return fmt.Errorf("banner mismatch: got %q", got)
+	}
 	if _, err := clientSide.Write([]byte(payload)); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}
 	buf := make([]byte, len(payload))
 	if _, err := io.ReadFull(clientSide, buf); err != nil {
-		return fmt.Errorf("read: %w", err)
+		return fmt.Errorf("read echo: %w", err)
 	}
 	if string(buf) != payload {
 		return fmt.Errorf("echo mismatch: got %q want %q", buf, payload)
@@ -132,16 +131,20 @@ func runClient(t *testing.T, a *Activator, port int, payload string) error {
 	return nil
 }
 
-func TestWakeSpliceAndSingleflight(t *testing.T) {
+// The headline regression test for the mesh finding: the target address
+// accepts TCP while "suspended", and the proxy must NOT be fooled — it must
+// wake the target (exactly once for N concurrent connections) and only then
+// splice.
+func TestSilentMeshAcceptTriggersWakeAndSingleflight(t *testing.T) {
 	fake := newFakeAPI(t)
-	a := New(fake, testOptions(fake.port))
+	a := New(fake, testOptions())
 	defer a.Close()
 
 	const n = 8
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		go func(i int) {
-			errs <- runClient(t, a, fake.port, fmt.Sprintf("hello-%d", i))
+			errs <- runClient(t, a, fake.port(), fmt.Sprintf("hello-%d", i))
 		}(i)
 	}
 	for i := 0; i < n; i++ {
@@ -157,10 +160,10 @@ func TestWakeSpliceAndSingleflight(t *testing.T) {
 
 func TestIdleSuspendAfterConnectionsClose(t *testing.T) {
 	fake := newFakeAPI(t)
-	a := New(fake, testOptions(fake.port))
+	a := New(fake, testOptions())
 	defer a.Close()
 
-	if err := runClient(t, a, fake.port, "ping"); err != nil {
+	if err := runClient(t, a, fake.port(), "ping"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,19 +176,19 @@ func TestIdleSuspendAfterConnectionsClose(t *testing.T) {
 
 func TestNewConnectionCancelsIdleTimer(t *testing.T) {
 	fake := newFakeAPI(t)
-	opts := testOptions(fake.port)
+	opts := testOptions()
 	opts.IdleHold = 300 * time.Millisecond
 	a := New(fake, opts)
 	defer a.Close()
 
-	if err := runClient(t, a, fake.port, "first"); err != nil {
+	if err := runClient(t, a, fake.port(), "first"); err != nil {
 		t.Fatal(err)
 	}
 	// Reconnect well inside the idle window, then hold the connection open
 	// past where the original timer would have fired.
 	clientSide, proxySide := net.Pipe()
 	done := make(chan struct{})
-	go func() { defer close(done); a.HandleConn(context.Background(), proxySide, fake.port) }()
+	go func() { defer close(done); a.HandleConn(context.Background(), proxySide, fake.port()) }()
 	time.Sleep(500 * time.Millisecond)
 
 	if got := fake.suspendCalls.Load(); got != 0 {
@@ -204,7 +207,7 @@ func TestNewConnectionCancelsIdleTimer(t *testing.T) {
 func TestMaxHoldDropsConnectionWhenTargetNeverReady(t *testing.T) {
 	fake := newFakeAPI(t)
 	fake.failWakes = true
-	opts := testOptions(fake.port)
+	opts := testOptions()
 	opts.MaxHold = 300 * time.Millisecond
 	opts.WakeTimeout = 10 * time.Second // wake would keep polling; MaxHold must cut the client loose
 	a := New(fake, opts)
@@ -213,13 +216,11 @@ func TestMaxHoldDropsConnectionWhenTargetNeverReady(t *testing.T) {
 	clientSide, proxySide := net.Pipe()
 	done := make(chan struct{})
 	start := time.Now()
-	go func() { defer close(done); a.HandleConn(context.Background(), proxySide, fake.port) }()
+	go func() { defer close(done); a.HandleConn(context.Background(), proxySide, fake.port()) }()
 
-	// The proxy should close our connection once MaxHold expires.
 	clientSide.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
 	buf := make([]byte, 1)
-	_, err := clientSide.Read(buf)
-	if err == nil {
+	if _, err := clientSide.Read(buf); err == nil {
 		t.Fatal("expected the held connection to be closed")
 	}
 	<-done
@@ -228,15 +229,13 @@ func TestMaxHoldDropsConnectionWhenTargetNeverReady(t *testing.T) {
 	}
 }
 
-func TestFastPathSkipsWake(t *testing.T) {
+func TestFastPathSkipsWakeWhenTargetSpeaks(t *testing.T) {
 	fake := newFakeAPI(t)
-	if err := fake.start(); err != nil { // target already running
-		t.Fatal(err)
-	}
-	a := New(fake, testOptions(fake.port))
+	fake.awake.Store(true) // target genuinely up: banner flows
+	a := New(fake, testOptions())
 	defer a.Close()
 
-	if err := runClient(t, a, fake.port, "already-up"); err != nil {
+	if err := runClient(t, a, fake.port(), "already-up"); err != nil {
 		t.Fatal(err)
 	}
 	if got := fake.wakeCalls.Load(); got != 0 {
@@ -246,15 +245,13 @@ func TestFastPathSkipsWake(t *testing.T) {
 
 func TestStatsReflectDemand(t *testing.T) {
 	fake := newFakeAPI(t)
-	if err := fake.start(); err != nil {
-		t.Fatal(err)
-	}
-	a := New(fake, testOptions(fake.port))
+	fake.awake.Store(true)
+	a := New(fake, testOptions())
 	defer a.Close()
 
 	clientSide, proxySide := net.Pipe()
 	done := make(chan struct{})
-	go func() { defer close(done); a.HandleConn(context.Background(), proxySide, fake.port) }()
+	go func() { defer close(done); a.HandleConn(context.Background(), proxySide, fake.port()) }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for a.Stats().ActiveConnections != 1 {

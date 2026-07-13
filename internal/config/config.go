@@ -34,6 +34,7 @@ type Config struct {
 	MaxHold          time.Duration // MAX_HOLD, default 90s
 	WakePollInterval time.Duration // WAKE_POLL_INTERVAL, default 500ms
 	WakeTimeout      time.Duration // WAKE_TIMEOUT, default 120s
+	ProbeWindow      time.Duration // PROBE_WINDOW, default 2s — max wait for the server's first bytes
 
 	HealthPort int // HEALTH_PORT, default 8081
 }
@@ -82,6 +83,9 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if c.WakeTimeout, err = durationOr(getenv("WAKE_TIMEOUT"), 120*time.Second); err != nil {
 		return c, fmt.Errorf("WAKE_TIMEOUT: %w", err)
+	}
+	if c.ProbeWindow, err = durationOr(getenv("PROBE_WINDOW"), 2*time.Second); err != nil {
+		return c, fmt.Errorf("PROBE_WINDOW: %w", err)
 	}
 
 	if c.HealthPort, err = intOr(getenv("HEALTH_PORT"), 8081); err != nil {
