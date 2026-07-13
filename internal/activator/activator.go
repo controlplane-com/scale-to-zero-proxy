@@ -80,11 +80,12 @@ type Activator struct {
 	api API
 	opt Options
 
-	mu        sync.Mutex
-	demand    int // held + spliced connections
-	idleTimer *time.Timer
-	wake      *wakeOp
-	closed    bool
+	mu           sync.Mutex
+	demand       int // held + spliced connections
+	idleTimer    *time.Timer
+	wake         *wakeOp
+	lastWakeDone time.Time // when the most recent wake finished (guards stale probe verdicts)
+	closed       bool
 }
 
 // New creates an Activator and starts the initial idle countdown, so a target
@@ -154,12 +155,13 @@ func (a *Activator) connectBackend(ctx context.Context, targetPort int) (net.Con
 	addr := net.JoinHostPort(a.opt.TargetHost, strconv.Itoa(targetPort))
 
 	// Fast path: target proves it is really up by speaking first.
+	probeStart := time.Now()
 	if err := a.probeReady(ctx, addr); err == nil {
 		return a.dial(ctx, addr)
 	}
 
 	// Slow path: trigger (or join) a wake, then dial fresh for the splice.
-	if err := a.ensureAwake(ctx, addr); err != nil {
+	if err := a.ensureAwake(ctx, addr, probeStart); err != nil {
 		return nil, err
 	}
 	return a.dial(ctx, addr)
@@ -199,21 +201,35 @@ func (a *Activator) probeReady(ctx context.Context, addr string) error {
 
 // ensureAwake joins the in-flight wake operation, starting one if none exists
 // (singleflight: N concurrent connections cause exactly one wake).
-func (a *Activator) ensureAwake(ctx context.Context, addr string) error {
-	a.mu.Lock()
-	w := a.wake
-	if w == nil {
-		w = &wakeOp{done: make(chan struct{})}
-		a.wake = w
-		go a.runWake(w, addr)
-	}
-	a.mu.Unlock()
+//
+// probeStart is when the caller's failed readiness probe BEGAN. If a wake
+// completed after that instant, the caller's verdict is stale — the target may
+// have come up mid-probe — so we re-validate instead of waking again.
+func (a *Activator) ensureAwake(ctx context.Context, addr string, probeStart time.Time) error {
+	for {
+		a.mu.Lock()
+		w := a.wake
+		if w == nil {
+			if a.lastWakeDone.After(probeStart) {
+				a.mu.Unlock()
+				if err := a.probeReady(ctx, addr); err == nil {
+					return nil
+				}
+				probeStart = time.Now()
+				continue
+			}
+			w = &wakeOp{done: make(chan struct{})}
+			a.wake = w
+			go a.runWake(w, addr)
+		}
+		a.mu.Unlock()
 
-	select {
-	case <-w.done:
-		return w.err
-	case <-ctx.Done():
-		return fmt.Errorf("gave up waiting for wake: %w", ctx.Err())
+		select {
+		case <-w.done:
+			return w.err
+		case <-ctx.Done():
+			return fmt.Errorf("gave up waiting for wake: %w", ctx.Err())
+		}
 	}
 }
 
@@ -238,6 +254,7 @@ func (a *Activator) runWake(w *wakeOp, addr string) {
 	w.err = err
 	a.mu.Lock()
 	a.wake = nil
+	a.lastWakeDone = time.Now()
 	a.mu.Unlock()
 	close(w.done)
 }
